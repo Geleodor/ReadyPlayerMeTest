@@ -1,0 +1,184 @@
+using System;
+using Photon.Pun;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using CoreControllers;
+using Cysharp.Threading.Tasks;
+using TMPro;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+
+namespace VRShooter
+{
+    //[RequireComponent(typeof(PhotonView))]
+    public class AvatarHeadBehaviour : MonoBehaviour, IPunObservable
+    {
+        public Transform bodyAvatar;
+        [SerializeField] public OvrAvatar ovrAvatar;
+        [SerializeField] private GameObject _goUserName;
+        [SerializeField] private TMP_Text _userName;
+        private GameObject _goCamera;
+        private OvrAvatarRemoteDriver remoteDriver;
+        private int localSequence;
+        private List<byte[]> packetData;
+        private PhotonView photonView;
+        private PlayerController _playerController;
+        private SceneTransitionController _sceneTransitionController;
+
+        private Vector3 _vector3 => new Vector3(0, 0.45f, 0);
+
+        public TMP_Text UserName
+        {
+            get => _userName;
+            set => _userName = value;
+        }
+
+        void Start()
+        {
+            _playerController = GlobalManagerControllers.Instance.GetController<PlayerController>();
+            _sceneTransitionController = GlobalManagerControllers.Instance.GetController<SceneTransitionController>();
+            _goCamera = _playerController.PlayerMain.GetComponentInChildren<Camera>().gameObject;
+            _sceneTransitionController.OnStartLoadScene += SceneTransitionControllerOnStartLoadScene;
+            photonView = GetComponent<PhotonView>();
+            if (photonView.IsMine)
+            {
+                ovrAvatar = GetComponent<OvrAvatar>();
+                Debug.Log("Loacal + " + this.gameObject.name);
+                packetData = new List<byte[]>();
+                ovrAvatar.RecordPackets = true;
+                ovrAvatar.PacketRecorded += OnLocalAvatarPacketRecorded;
+            }
+            else
+            {
+                Debug.Log("Remote + " + this.gameObject.name);
+                remoteDriver = GetComponentInChildren<OvrAvatarRemoteDriver>();
+                // transform.parent = GameObject.Find("CenterPlayerPositionHandlerRemote").transform;
+            }
+            StartCoroutine(AddComponent());
+        }
+
+        private void SceneTransitionControllerOnStartLoadScene(string obj)
+        {
+            Destroy(this.gameObject);
+        }
+
+        void LateUpdate()
+        {
+            if (ovrAvatar.MouthAnchor != null && _goCamera != null)
+            {
+                _goUserName.transform.position = ovrAvatar.MouthAnchor.transform.position + _vector3;
+                _goUserName.transform.LookAt(_goCamera.transform);
+            }
+        }
+        private IEnumerator AddComponent()
+        {
+            yield return new WaitForSeconds(3f);
+            ovrAvatar.MouthAnchor.gameObject.AddComponent<PhotonTransformView>();
+        }
+
+
+        public void OnDisable()
+        {
+            if (photonView != null && photonView.IsMine)
+            {
+                ovrAvatar.RecordPackets = false;
+                ovrAvatar.PacketRecorded -= OnLocalAvatarPacketRecorded;
+            }
+        }
+
+        void OnDestroy()
+        {
+            _sceneTransitionController.OnStartLoadScene -= SceneTransitionControllerOnStartLoadScene;
+        }
+        public void OnLocalAvatarPacketRecorded(object sender, OvrAvatar.PacketEventArgs args)
+        {
+            //if (notReadyForSerialization)
+            //{
+            //    return;
+            //}
+            using (MemoryStream outputStream = new MemoryStream())
+            {
+                BinaryWriter writer = new BinaryWriter(outputStream);
+
+                var size = Oculus.Avatar.CAPI.ovrAvatarPacket_GetSize(args.Packet.ovrNativePacket);
+                byte[] data = new byte[size];
+                Oculus.Avatar.CAPI.ovrAvatarPacket_Write(args.Packet.ovrNativePacket, size, data);
+
+                writer.Write(localSequence++);
+                writer.Write(size);
+                writer.Write(data);
+
+                packetData.Add(outputStream.ToArray());
+            }
+        }
+
+        private void DeserializeAndQueuePacketData(byte[] data)
+        {
+            //if (notReadyForSerialization)
+            //{
+            //    return;
+            //}
+
+            using (MemoryStream inputStream = new MemoryStream(data))
+            {
+                BinaryReader reader = new BinaryReader(inputStream);
+                int remoteSequence = reader.ReadInt32();
+
+                int size = reader.ReadInt32();
+                byte[] sdkData = reader.ReadBytes(size);
+
+                System.IntPtr packet = Oculus.Avatar.CAPI.ovrAvatarPacket_Read((System.UInt32)data.Length, sdkData);
+                remoteDriver.QueuePacket(remoteSequence, new OvrAvatarPacket { ovrNativePacket = packet });
+            }
+        }
+
+        public void OnPhotonSerializeView(PhotonStream stream, PhotonMessageInfo info)
+        {
+            //if (notReadyForSerialization)
+            //{
+            //    return;
+            //}
+
+            if (stream.IsWriting)
+            {
+                if (packetData.Count == 0)
+                {
+                    return;
+                }
+
+                stream.SendNext(packetData.Count);
+
+                foreach (byte[] b in packetData)
+                {
+                    stream.SendNext(b);
+                }
+
+                packetData.Clear();
+            }
+
+            if (stream.IsReading)
+            {
+                int num = (int)stream.ReceiveNext();
+
+                for (int counter = 0; counter < num; ++counter)
+                {
+                    byte[] data = (byte[])stream.ReceiveNext();
+
+                    DeserializeAndQueuePacketData(data);
+                }
+            }
+        }
+        private bool notReadyForSerialization
+        {
+            get
+            {
+                return (!PhotonNetwork.InRoom || (PhotonNetwork.CurrentRoom.PlayerCount < 2) ||
+                        !Oculus.Platform.Core.IsInitialized() /*|| !ovrAvatar.Initialized*/);
+            }
+        }
+
+    }
+}
+
